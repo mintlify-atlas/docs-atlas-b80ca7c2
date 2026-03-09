@@ -1,0 +1,579 @@
+---
+title: Dynamic Visibility Timeouts
+description: Implement distributed backoff strategies with dynamic SQS visibility timeout control
+---
+
+## Overview
+
+Carrier supports **dynamic visibility timeouts**, allowing your worker application to control when messages are re-delivered from SQS. This enables sophisticated distributed backoff strategies, particularly useful for:
+
+- Rate limiting and throttling
+- Exponential backoff for external API calls
+- Scheduled retries based on business logic
+- Handling temporary failures gracefully
+
+<Info>
+Unlike traditional retry mechanisms that rely on SQS's fixed visibility timeout, dynamic timeouts give your application fine-grained control over message re-delivery timing.
+</Info>
+
+## How It Works
+
+### Headers Sent by Carrier
+
+Carrier includes metadata headers with every webhook request to help you implement intelligent retry logic:
+
+| Header | Description | Source |
+|--------|-------------|--------|
+| `X-Carrier-Receive-Count` | Number of times this message has been received from SQS | `ApproximateReceiveCount` attribute |
+| `X-Carrier-First-Receive-Time` | Unix timestamp (seconds) of the first time this message was received | `ApproximateFirstReceiveTimestamp` attribute |
+
+These headers are defined in `transmitter/webhook/transmitter.go:15-22`:
+
+```go
+const (
+    // HeaderPrefix is the prefix used for all HTTP request headers sent by the Transmitter.
+    HeaderPrefix = "X-Carrier-"
+    // HeaderRetryAfter is the standard Retry-After header.
+    HeaderRetryAfter = "Retry-After"
+    // HeaderContentType is the standard Content-Type header.
+    HeaderContentType = "Content-Type"
+)
+```
+
+The headers are populated from SQS message attributes in `receiver/sqs/sqs.go:135-155`:
+
+```go
+func (h *handler) generateAttributes(m *message) transmitter.TransmitAttributes {
+    attributes := make(transmitter.TransmitAttributes)
+    for k, v := range m.Attributes {
+        switch k {
+        case SQSAttributeApproxomiteReceiveCount:
+            attributes[TransmitAttributeReceiveCount] = v
+        case SQSAttributeApproxomiteFirstReceiveTimestamp:
+            attributes[TransmitAttributeFirstReceiveTime] = v
+        }
+    }
+    // ... additional attribute handling
+    return attributes
+}
+```
+
+### Setting Visibility Timeout
+
+To delay message re-delivery, your webhook endpoint should:
+
+1. **Return HTTP 429** (Too Many Requests)
+2. **Include the `Retry-After` header** with the delay in seconds
+
+Carrier will automatically update the message's visibility timeout so it won't be received again until after the specified time.
+
+<CodeGroup>
+```go Go
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    receiveCount := r.Header.Get("X-Carrier-Receive-Count")
+    
+    // Calculate exponential backoff
+    count, _ := strconv.Atoi(receiveCount)
+    backoffSeconds := int(math.Pow(2, float64(count))) // 1, 2, 4, 8, 16...
+    
+    // Set retry delay
+    w.Header().Set("Retry-After", strconv.Itoa(backoffSeconds))
+    w.WriteHeader(http.StatusTooManyRequests)
+}
+```
+
+```python Python
+from flask import Flask, request
+import math
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    receive_count = int(request.headers.get('X-Carrier-Receive-Count', 0))
+    
+    # Calculate exponential backoff
+    backoff_seconds = int(2 ** receive_count)  # 1, 2, 4, 8, 16...
+    
+    # Set retry delay
+    return '', 429, {'Retry-After': str(backoff_seconds)}
+```
+
+```javascript Node.js
+const express = require('express');
+const app = express();
+
+app.post('/webhook', (req, res) => {
+    const receiveCount = parseInt(req.headers['x-carrier-receive-count'] || 0);
+    
+    // Calculate exponential backoff
+    const backoffSeconds = Math.pow(2, receiveCount); // 1, 2, 4, 8, 16...
+    
+    // Set retry delay
+    res.set('Retry-After', backoffSeconds.toString());
+    res.sendStatus(429);
+});
+```
+</CodeGroup>
+
+## Implementation Details
+
+### Carrier Processing
+
+When Carrier receives a 429 response, it extracts the `Retry-After` header value and updates the SQS message visibility timeout (`transmitter/webhook/transmitter.go:113-132`):
+
+```go
+switch res.StatusCode {
+case http.StatusOK:
+    // transmit successful
+    return nil
+case http.StatusTooManyRequests:
+    // return a retryable error with the retry-after header value
+    retryAfter := res.Header.Get(HeaderRetryAfter)
+    if retryAfter != "" {
+        seconds, err := strconv.Atoi(retryAfter)
+        if err != nil {
+            // cannot retry if we cannot parse the Retry-After header
+            return fmt.Errorf("%w: %w: %w", transmitter.ErrTransmitFailed, ErrStatusCode429, err)
+        }
+        return transmitter.NewTransmitRetryableError(ErrStatusCode429, time.Duration(seconds*int(time.Second)))
+    }
+    return fmt.Errorf("%w: %w: %w", transmitter.ErrTransmitFailed, ErrStatusCode429, ErrNoRetryAfterHeader)
+default:
+    // return a non-retryable error
+    return fmt.Errorf("%w: %w: %d", transmitter.ErrTransmitFailed, ErrNon200StatusCode, res.StatusCode)
+}
+```
+
+### SQS Visibility Update
+
+The receiver processes retryable errors and batches visibility timeout updates (`receiver/sqs/sqs.go:248-293`):
+
+```go
+for range len(res.Messages) {
+    r := <-p.results
+    if r.err != nil {
+        var err *transmitter.TransmitRetryableError
+        if errors.As(r.err, &err) {
+            // update visibility timeout on retryable errors
+            retryEntries = append(retryEntries, types.ChangeMessageVisibilityBatchRequestEntry{
+                Id:                r.MessageID,
+                ReceiptHandle:     r.ReceiptHandle,
+                VisibilityTimeout: int32(err.RetryAfter.Seconds()),
+            })
+        } else {
+            p.log.Error("failed to transmit message", "error", r.err)
+        }
+    } else {
+        deleteEntries = append(deleteEntries, types.DeleteMessageBatchRequestEntry{
+            Id:            r.MessageID,
+            ReceiptHandle: r.ReceiptHandle,
+        })
+    }
+}
+
+if len(retryEntries) > 0 {
+    // update visibility timeout on messages that received retryable errors
+    _, err := p.client.ChangeMessageVisibilityBatch(p.ctx, &sqs.ChangeMessageVisibilityBatchInput{
+        QueueUrl: &p.queueURL,
+        Entries:  retryEntries,
+    })
+    if err != nil {
+        p.log.Error("failed to update message visibility", "error", err)
+    } else {
+        p.log.Debug("updated message visibility", "count", len(retryEntries))
+    }
+}
+```
+
+<Warning>
+If the `Retry-After` header is missing or cannot be parsed as an integer, Carrier treats it as a permanent failure and the message will not be retried.
+</Warning>
+
+## Common Backoff Strategies
+
+### Exponential Backoff
+
+Double the delay with each retry attempt:
+
+<CodeGroup>
+```go Go
+func calculateExponentialBackoff(receiveCount int, baseSeconds int) int {
+    return baseSeconds * int(math.Pow(2, float64(receiveCount-1)))
+}
+
+// Examples:
+// Attempt 1: 2s
+// Attempt 2: 4s
+// Attempt 3: 8s
+// Attempt 4: 16s
+```
+
+```python Python
+def calculate_exponential_backoff(receive_count: int, base_seconds: int = 2) -> int:
+    return base_seconds * (2 ** (receive_count - 1))
+
+# Examples:
+# Attempt 1: 2s
+# Attempt 2: 4s
+# Attempt 3: 8s
+# Attempt 4: 16s
+```
+</CodeGroup>
+
+### Exponential Backoff with Cap
+
+Prevent extremely long delays by capping the maximum backoff:
+
+<CodeGroup>
+```go Go
+func calculateCappedBackoff(receiveCount int, baseSeconds int, maxSeconds int) int {
+    backoff := baseSeconds * int(math.Pow(2, float64(receiveCount-1)))
+    if backoff > maxSeconds {
+        return maxSeconds
+    }
+    return backoff
+}
+
+// With base=2, max=300 (5 minutes):
+// Attempt 1: 2s
+// Attempt 2: 4s
+// Attempt 3: 8s
+// ...
+// Attempt 8: 256s
+// Attempt 9+: 300s (capped)
+```
+
+```python Python
+def calculate_capped_backoff(receive_count: int, base_seconds: int = 2, max_seconds: int = 300) -> int:
+    backoff = base_seconds * (2 ** (receive_count - 1))
+    return min(backoff, max_seconds)
+
+# With base=2, max=300 (5 minutes):
+# Attempt 1: 2s
+# Attempt 2: 4s
+# Attempt 3: 8s
+# ...
+# Attempt 8: 256s
+# Attempt 9+: 300s (capped)
+```
+</CodeGroup>
+
+### Linear Backoff
+
+Increase delay by a fixed amount:
+
+<CodeGroup>
+```go Go
+func calculateLinearBackoff(receiveCount int, incrementSeconds int) int {
+    return receiveCount * incrementSeconds
+}
+
+// With increment=30:
+// Attempt 1: 30s
+// Attempt 2: 60s
+// Attempt 3: 90s
+// Attempt 4: 120s
+```
+
+```python Python
+def calculate_linear_backoff(receive_count: int, increment_seconds: int = 30) -> int:
+    return receive_count * increment_seconds
+
+# With increment=30:
+# Attempt 1: 30s
+# Attempt 2: 60s
+# Attempt 3: 90s
+# Attempt 4: 120s
+```
+</CodeGroup>
+
+### Fibonacci Backoff
+
+Use Fibonacci sequence for more gradual scaling:
+
+<CodeGroup>
+```go Go
+func calculateFibonacciBackoff(receiveCount int) int {
+    if receiveCount <= 1 {
+        return 1
+    }
+    a, b := 1, 1
+    for i := 2; i < receiveCount; i++ {
+        a, b = b, a+b
+    }
+    return b
+}
+
+// Examples:
+// Attempt 1: 1s
+// Attempt 2: 1s
+// Attempt 3: 2s
+// Attempt 4: 3s
+// Attempt 5: 5s
+// Attempt 6: 8s
+```
+
+```python Python
+def calculate_fibonacci_backoff(receive_count: int) -> int:
+    if receive_count <= 1:
+        return 1
+    a, b = 1, 1
+    for _ in range(2, receive_count):
+        a, b = b, a + b
+    return b
+
+# Examples:
+# Attempt 1: 1s
+# Attempt 2: 1s
+# Attempt 3: 2s
+# Attempt 4: 3s
+# Attempt 5: 5s
+# Attempt 6: 8s
+```
+</CodeGroup>
+
+## Real-World Use Cases
+
+### Rate Limiting External APIs
+
+<CodeGroup>
+```go Go
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    // Call external API
+    resp, err := http.Get("https://api.example.com/data")
+    
+    if resp != nil && resp.StatusCode == 429 {
+        // API is rate limited
+        retryAfter := resp.Header.Get("Retry-After")
+        if retryAfter != "" {
+            // Forward the API's retry-after to Carrier
+            w.Header().Set("Retry-After", retryAfter)
+            w.WriteHeader(http.StatusTooManyRequests)
+            return
+        }
+        
+        // Default backoff if no Retry-After header
+        receiveCount, _ := strconv.Atoi(r.Header.Get("X-Carrier-Receive-Count"))
+        backoff := int(math.Pow(2, float64(receiveCount)))
+        w.Header().Set("Retry-After", strconv.Itoa(backoff))
+        w.WriteHeader(http.StatusTooManyRequests)
+        return
+    }
+    
+    // Process normally
+    w.WriteHeader(http.StatusOK)
+}
+```
+
+```python Python
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # Call external API
+    resp = requests.get('https://api.example.com/data')
+    
+    if resp.status_code == 429:
+        # API is rate limited
+        retry_after = resp.headers.get('Retry-After')
+        
+        if retry_after:
+            # Forward the API's retry-after to Carrier
+            return '', 429, {'Retry-After': retry_after}
+        
+        # Default backoff if no Retry-After header
+        receive_count = int(request.headers.get('X-Carrier-Receive-Count', 0))
+        backoff = 2 ** receive_count
+        return '', 429, {'Retry-After': str(backoff)}
+    
+    # Process normally
+    return '', 200
+```
+</CodeGroup>
+
+### Time-Based Processing
+
+Schedule processing for a specific time:
+
+<CodeGroup>
+```go Go
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    // Parse message to get scheduled time
+    var msg Message
+    json.NewDecoder(r.Body).Decode(&msg)
+    
+    scheduledTime := msg.ProcessAt // Unix timestamp
+    now := time.Now().Unix()
+    
+    if now < scheduledTime {
+        // Not yet time to process
+        delay := scheduledTime - now
+        w.Header().Set("Retry-After", strconv.FormatInt(delay, 10))
+        w.WriteHeader(http.StatusTooManyRequests)
+        return
+    }
+    
+    // Process the message
+    processMessage(msg)
+    w.WriteHeader(http.StatusOK)
+}
+```
+
+```python Python
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # Parse message to get scheduled time
+    msg = request.get_json()
+    scheduled_time = msg.get('process_at')  # Unix timestamp
+    now = int(time.time())
+    
+    if now < scheduled_time:
+        # Not yet time to process
+        delay = scheduled_time - now
+        return '', 429, {'Retry-After': str(delay)}
+    
+    # Process the message
+    process_message(msg)
+    return '', 200
+```
+</CodeGroup>
+
+### Circuit Breaker Pattern
+
+Protect downstream services with automatic backoff:
+
+<CodeGroup>
+```go Go
+type CircuitBreaker struct {
+    failures      int
+    lastFailure   time.Time
+    state         string // "closed", "open", "half-open"
+    threshold     int
+    resetTimeout  time.Duration
+}
+
+func (cb *CircuitBreaker) webhookHandler(w http.ResponseWriter, r *http.Request) {
+    if cb.state == "open" {
+        // Circuit is open, calculate backoff
+        timeSinceFailure := time.Since(cb.lastFailure)
+        if timeSinceFailure < cb.resetTimeout {
+            remaining := cb.resetTimeout - timeSinceFailure
+            w.Header().Set("Retry-After", strconv.Itoa(int(remaining.Seconds())))
+            w.WriteHeader(http.StatusTooManyRequests)
+            return
+        }
+        // Try half-open state
+        cb.state = "half-open"
+    }
+    
+    // Attempt to process
+    err := processMessage(r.Body)
+    if err != nil {
+        cb.failures++
+        cb.lastFailure = time.Now()
+        
+        if cb.failures >= cb.threshold {
+            cb.state = "open"
+        }
+        
+        // Exponential backoff
+        backoff := int(math.Pow(2, float64(cb.failures)))
+        w.Header().Set("Retry-After", strconv.Itoa(backoff))
+        w.WriteHeader(http.StatusTooManyRequests)
+        return
+    }
+    
+    // Success - reset circuit breaker
+    cb.failures = 0
+    cb.state = "closed"
+    w.WriteHeader(http.StatusOK)
+}
+```
+</CodeGroup>
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Cap Maximum Backoff" icon="stopwatch">
+    Prevent indefinite delays by setting a maximum backoff value (e.g., 5-15 minutes).
+  </Card>
+  <Card title="Use Receive Count" icon="calculator">
+    Always base backoff calculations on `X-Carrier-Receive-Count` for consistency.
+  </Card>
+  <Card title="Add Jitter" icon="wave-pulse">
+    Add random variation to prevent thundering herd problems when multiple messages retry simultaneously.
+  </Card>
+  <Card title="Monitor Retry Patterns" icon="chart-line">
+    Track receive counts and retry delays to identify systemic issues.
+  </Card>
+</CardGroup>
+
+### Adding Jitter
+
+Prevent synchronized retries by adding randomness:
+
+<CodeGroup>
+```go Go
+import "math/rand"
+
+func calculateBackoffWithJitter(receiveCount int, baseSeconds int) int {
+    backoff := baseSeconds * int(math.Pow(2, float64(receiveCount-1)))
+    jitter := rand.Intn(backoff / 4) // Add up to 25% jitter
+    return backoff + jitter
+}
+```
+
+```python Python
+import random
+
+def calculate_backoff_with_jitter(receive_count: int, base_seconds: int = 2) -> int:
+    backoff = base_seconds * (2 ** (receive_count - 1))
+    jitter = random.randint(0, backoff // 4)  # Add up to 25% jitter
+    return backoff + jitter
+```
+</CodeGroup>
+
+## Limitations
+
+<Warning>
+SQS has a maximum visibility timeout of **12 hours** (43,200 seconds). Attempting to set a longer timeout will result in an error.
+</Warning>
+
+<Note>
+The `Retry-After` header must be an integer representing seconds. HTTP date formats are not supported.
+</Note>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Messages not being retried">
+    - Verify you're returning HTTP 429 status code
+    - Check that the `Retry-After` header is present and contains a valid integer
+    - Review Carrier logs for "failed to update message visibility" errors
+    - Ensure the retry delay is less than 12 hours
+  </Accordion>
+  
+  <Accordion title="Messages retrying too quickly">
+    - Verify your backoff calculation logic
+    - Check that you're reading the `X-Carrier-Receive-Count` header correctly
+    - Add logging to see what `Retry-After` values you're returning
+  </Accordion>
+  
+  <Accordion title="Receive count not incrementing">
+    The receive count is managed by SQS and only increments when:
+    - The message becomes visible again (after visibility timeout expires)
+    - The message is received from the queue
+    
+    It will NOT increment if the message is deleted (successful processing).
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Health Checks" href="/operations/health-checks">
+    Monitor webhook endpoint availability
+  </Card>
+  <Card title="Monitoring" href="/operations/monitoring">
+    Track message processing and retry patterns
+  </Card>
+</CardGroup>

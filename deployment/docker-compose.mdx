@@ -1,0 +1,247 @@
+---
+title: Docker Compose Setup
+description: Deploy Carrier locally using Docker Compose for development and testing
+---
+
+## Overview
+
+Carrier can be used locally in a Docker Compose stack for development and testing. This guide shows you how to configure Carrier as a sidecar service alongside your event worker application.
+
+## Basic Docker Compose Configuration
+
+Here's a complete Docker Compose setup for running Carrier with a worker application that expects webhooks at `/webhook` on port `9000`:
+
+```yml
+services:
+  sqs:
+    image: roribio/alpine-sqs
+  carrier:
+    image: amplifysecurity/carrier
+    restart: unless-stopped
+    volumes:
+      - ${HOME}/.aws/credentials:/.aws/credentials
+    links:
+      - sqs:sqs
+      - worker:worker
+    environment:
+      CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+      CARRIER_SQS_ENDPOINT: http://sqs:9324
+      CARRIER_SQS_QUEUE_NAME: default
+  worker:
+    build: .
+```
+
+<Note>
+  This example requires AWS credentials to be mounted even though they are not used with the local SQS container, otherwise the AWS SDK will panic.
+</Note>
+
+## Service Configuration Explained
+
+### SQS Service
+
+```yml
+sqs:
+  image: roribio/alpine-sqs
+```
+
+The `roribio/alpine-sqs` image provides a local SQS-compatible service for testing. This lightweight Alpine-based image runs on port `9324` by default and is perfect for local development.
+
+### Carrier Service
+
+```yml
+carrier:
+  image: amplifysecurity/carrier
+  restart: unless-stopped
+  volumes:
+    - ${HOME}/.aws/credentials:/.aws/credentials
+  links:
+    - sqs:sqs
+    - worker:worker
+  environment:
+    CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+    CARRIER_SQS_ENDPOINT: http://sqs:9324
+    CARRIER_SQS_QUEUE_NAME: default
+```
+
+**Key configuration options:**
+
+- **Image**: Uses the official `amplifysecurity/carrier` image (under 8MB)
+- **Restart policy**: `unless-stopped` ensures Carrier restarts automatically if it crashes
+- **Volume mount**: Maps your local AWS credentials into the container at `/.aws/credentials`
+- **Links**: Connects to both the `sqs` and `worker` services for internal networking
+
+**Environment variables:**
+
+- `CARRIER_WEBHOOK_ENDPOINT`: The full URL where your worker expects webhook POST requests
+- `CARRIER_SQS_ENDPOINT`: Points to the local SQS service
+- `CARRIER_SQS_QUEUE_NAME`: The name of the SQS queue to consume from
+
+### Worker Service
+
+```yml
+worker:
+  build: .
+```
+
+Your application service that processes webhook events. Replace `build: .` with your specific configuration (e.g., image name, build context, or docker compose file reference).
+
+## Local Development Setup
+
+### Step 1: Create docker-compose.yml
+
+Create a `docker-compose.yml` file in your project root with the configuration above, adjusting the worker configuration to match your application.
+
+### Step 2: Configure Environment Variables
+
+You can customize the configuration using additional environment variables:
+
+```yml
+carrier:
+  image: amplifysecurity/carrier
+  restart: unless-stopped
+  volumes:
+    - ${HOME}/.aws/credentials:/.aws/credentials
+  links:
+    - sqs:sqs
+    - worker:worker
+  environment:
+    # Required
+    CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+    CARRIER_SQS_ENDPOINT: http://sqs:9324
+    CARRIER_SQS_QUEUE_NAME: default
+    
+    # Optional - Development features
+    CARRIER_ENABLE_COLORIZED_LOGGING: "true"
+    CARRIER_ENABLE_STAT_LOG: "true"
+    CARRIER_STAT_LOG_TIMER: 30s
+    
+    # Optional - Performance tuning
+    CARRIER_SQS_BATCH_SIZE: "10"
+    CARRIER_SQS_RECEIVERS: "2"
+    CARRIER_SQS_RECEIVER_WORKERS: "10"
+    
+    # Optional - Webhook configuration
+    CARRIER_WEBHOOK_REQUEST_TIMEOUT: 30s
+    CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE: application/json
+```
+
+### Step 3: Start the Stack
+
+```bash
+docker-compose up
+```
+
+To run in detached mode:
+
+```bash
+docker-compose up -d
+```
+
+### Step 4: View Logs
+
+```bash
+# All services
+docker-compose logs -f
+
+# Carrier only
+docker-compose logs -f carrier
+
+# Worker only
+docker-compose logs -f worker
+```
+
+## Development-Specific Configuration
+
+### Enable Colorized Logging
+
+For better readability during local development:
+
+```yml
+environment:
+  CARRIER_ENABLE_COLORIZED_LOGGING: "true"
+```
+
+### Enable Statistics Logging
+
+Monitor Carrier's performance with periodic stats:
+
+```yml
+environment:
+  CARRIER_ENABLE_STAT_LOG: "true"
+  CARRIER_STAT_LOG_TIMER: 30s  # Log stats every 30 seconds
+```
+
+### Health Check Configuration
+
+Ensure Carrier waits for your worker to be ready:
+
+```yml
+environment:
+  CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT: http://worker:9000/health
+  CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL: 10s
+  CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT: 5s
+  CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT: "3"
+```
+
+## Using with AWS SQS
+
+To connect to a real AWS SQS queue instead of the local container:
+
+```yml
+services:
+  carrier:
+    image: amplifysecurity/carrier
+    restart: unless-stopped
+    volumes:
+      - ${HOME}/.aws/credentials:/.aws/credentials
+    links:
+      - worker:worker
+    environment:
+      CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+      CARRIER_SQS_ENDPOINT: https://sqs.us-west-2.amazonaws.com
+      CARRIER_SQS_QUEUE_NAME: my-queue-name
+      CARRIER_ENABLE_COLORIZED_LOGGING: "true"
+  worker:
+    build: .
+```
+
+<Note>
+  Remove the `sqs` service and its link when connecting to AWS SQS.
+</Note>
+
+## Troubleshooting
+
+### AWS SDK Panics
+
+If you see AWS SDK errors, ensure your credentials are properly mounted:
+
+```yml
+volumes:
+  - ${HOME}/.aws/credentials:/.aws/credentials
+```
+
+### Worker Not Receiving Messages
+
+Check that:
+1. The webhook endpoint URL is correct
+2. The worker service is listening on the expected port
+3. Service links are properly configured
+4. Network connectivity between containers is working
+
+### Connection Refused Errors
+
+If Carrier can't connect to the worker:
+1. Verify the worker is running: `docker-compose ps`
+2. Check worker logs: `docker-compose logs worker`
+3. Ensure the port and path match your worker's configuration
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes Deployment" icon="dharmachakra" href="/deployment/kubernetes">
+    Deploy Carrier as a sidecar in Kubernetes
+  </Card>
+  <Card title="Configuration Reference" icon="gear" href="/deployment/configuration">
+    Complete list of configuration options
+  </Card>
+</CardGroup>

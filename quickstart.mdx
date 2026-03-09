@@ -1,80 +1,233 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get Carrier running in minutes with Docker Compose or Kubernetes
 ---
 
-## Get started in three steps
+This guide will help you deploy Carrier quickly in your local development environment or production Kubernetes cluster.
 
-Get your documentation site running locally and make your first customization.
+## Local Development with Docker Compose
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Create a Docker Compose file">
+    Create a `docker-compose.yml` file with Carrier configured to forward SQS messages to your worker application.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```yaml docker-compose.yml
+    services:
+      sqs:
+        image: roribio/alpine-sqs
+      carrier:
+        image: amplifysecurity/carrier
+        restart: unless-stopped
+        volumes:
+          - ${HOME}/.aws/credentials:/.aws/credentials
+        links:
+          - sqs:sqs
+          - worker:worker
+        environment:
+          CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+          CARRIER_SQS_ENDPOINT: http://sqs:9324
+          CARRIER_SQS_QUEUE_NAME: default
+      worker:
+        build: .
+    ```
 
-### Step 2: Deploy your changes
+    <Note>
+      This example requires AWS credentials to be mounted even for local SQS, otherwise the AWS SDK will panic. The credentials don't need to be valid for local testing.
+    </Note>
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Configure your worker">
+    Ensure your worker application:
+    - Listens on port `9000` (or adjust `CARRIER_WEBHOOK_ENDPOINT`)
+    - Has a webhook endpoint at `/webhook` that accepts POST requests
+    - Returns appropriate HTTP status codes (200 for success, 429 for backoff)
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Start the stack">
+    ```bash
+    docker-compose up
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Carrier will start receiving messages from the local SQS queue and forwarding them to your worker.
+  </Step>
 
-### Step 3: Go live
+  <Step title="Verify it's working">
+    Send a test message to your SQS queue and watch the logs:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    docker-compose logs -f carrier
+    ```
 
-## Next steps
+    You should see Carrier receiving and transmitting messages to your webhook endpoint.
+  </Step>
+</Steps>
 
-Now that you have your docs running, explore these key features:
+## Kubernetes Deployment
+
+<Steps>
+  <Step title="Prepare your service account">
+    Create a Kubernetes ServiceAccount and map it to an IAM role with SQS permissions:
+
+    - `sqs:ReceiveMessage`
+    - `sqs:DeleteMessage`
+    - `sqs:GetQueueUrl`
+    - `sqs:ChangeMessageVisibility` (required for dynamic timeouts)
+  </Step>
+
+  <Step title="Create the deployment manifest">
+    Create a deployment with Carrier as a sidecar container:
+
+    ```yaml carrier-deployment.yml
+    ---
+    # SQS event worker pattern deployment
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: carrier-demo
+      namespace: demo
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: carrier-demo
+      template:
+        metadata:
+          labels:
+            app: carrier-demo
+        spec:
+          serviceAccountName: carrier-demo
+          containers:
+            - name: carrier
+              image: amplifysecurity/carrier
+              securityContext:
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+              env:
+                - name: CARRIER_WEBHOOK_ENDPOINT
+                  value: http://localhost:9000/webhook
+                - name: CARRIER_SQS_ENDPOINT
+                  value: https://sqs.us-west-2.amazonaws.com
+                - name: CARRIER_SQS_QUEUE_NAME
+                  value: carrier-demo
+            - name: worker
+              image: ${registry}/${container}:${tag}
+    ```
+
+    <Note>
+      This assumes the ServiceAccount `carrier-demo` is mapped to an IAM role with appropriate SQS permissions via IRSA (IAM Roles for Service Accounts).
+    </Note>
+  </Step>
+
+  <Step title="Deploy to your cluster">
+    ```bash
+    kubectl apply -f carrier-deployment.yml
+    ```
+  </Step>
+
+  <Step title="Verify the deployment">
+    Check that both containers are running:
+
+    ```bash
+    kubectl get pods -n demo -l app=carrier-demo
+    kubectl logs -n demo -l app=carrier-demo -c carrier
+    ```
+
+    You should see Carrier connecting to SQS and processing messages.
+  </Step>
+</Steps>
+
+## Essential Configuration
+
+### Required Environment Variables
+
+<ParamField path="CARRIER_SQS_ENDPOINT" type="string" required>
+  The AWS SQS service endpoint. Use regional endpoints like `https://sqs.us-west-2.amazonaws.com` or the local endpoint for testing.
+</ParamField>
+
+<ParamField path="CARRIER_SQS_QUEUE_NAME" type="string" required>
+  The name of your SQS queue (not the full ARN, just the name).
+</ParamField>
+
+### Recommended Settings
+
+<ParamField path="CARRIER_WEBHOOK_ENDPOINT" type="string" default="http://localhost:9000">
+  Full URL where webhooks should be sent. In Kubernetes, use `http://localhost:<port>/<path>` for sidecar containers.
+</ParamField>
+
+<ParamField path="CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT" type="string">
+  Health check endpoint for your webhook service. Highly recommended to prevent message failures during startup.
+
+  ```yaml
+  env:
+    - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+      value: http://localhost:9000/health
+  ```
+</ParamField>
+
+<ParamField path="CARRIER_SQS_BATCH_SIZE" type="integer" default="1">
+  Number of messages to receive per SQS request. Increase for higher throughput.
+</ParamField>
+
+<ParamField path="CARRIER_SQS_RECEIVER_WORKERS" type="integer" default="1">
+  Number of concurrent workers transmitting webhooks per receiver. Set this equal to batch size for parallel processing.
+</ParamField>
+
+## Performance Tuning
+
+For high-throughput scenarios, configure concurrency settings:
+
+```yaml
+env:
+  # Receive 10 messages per batch
+  - name: CARRIER_SQS_BATCH_SIZE
+    value: "10"
+  # Process all 10 messages in parallel
+  - name: CARRIER_SQS_RECEIVER_WORKERS
+    value: "10"
+  # Run 3 concurrent receivers
+  - name: CARRIER_SQS_RECEIVERS
+    value: "3"
+```
+
+This configuration processes up to 30 messages concurrently (3 receivers × 10 workers).
+
+<Warning>
+  Monitor your worker application's resource usage when increasing concurrency. Ensure it can handle the increased load.
+</Warning>
+
+## Enable Health Checks
+
+Health checks prevent message processing failures during application startup:
+
+```yaml
+env:
+  - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+    value: http://localhost:9000/health
+  - name: CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT
+    value: "5"
+  - name: CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL
+    value: "60s"
+```
+
+Carrier will:
+1. Wait for the health endpoint to return 200 before processing messages
+2. Check health every 60 seconds
+3. Exit after 5 consecutive failed health checks (triggering Kubernetes restart)
+
+## Next Steps
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Configuration Reference" icon="sliders" href="/deployment/configuration">
+    Explore all available environment variables and settings
+  </Card>
+  <Card title="Dynamic Visibility Timeouts" icon="clock" href="/operations/dynamic-visibility-timeouts">
+    Learn how to implement distributed backoff strategies
+  </Card>
+  <Card title="Health Monitoring" icon="heart-pulse" href="/operations/health-checks">
+    Configure advanced health check scenarios
+  </Card>
+  <Card title="Deployment Best Practices" icon="book" href="/deployment/kubernetes">
+    Production deployment patterns and recommendations
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

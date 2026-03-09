@@ -1,0 +1,347 @@
+---
+title: HTTP Headers
+description: Reference for HTTP headers sent and received by Carrier webhooks
+icon: network-wired
+---
+
+Carrier sends custom HTTP headers with each webhook request to provide message metadata and support dynamic backoff strategies. Understanding these headers is essential for implementing robust webhook handlers.
+
+## Headers Sent by Carrier
+
+All custom headers sent by Carrier use the `X-Carrier-` prefix.
+
+### X-Carrier-Receive-Count
+
+<ResponseField name="X-Carrier-Receive-Count" type="string">
+  The number of times this message has been received from SQS.
+  
+  This corresponds to the SQS `ApproximateReceiveCount` attribute and indicates how many times the particular message has been delivered.
+  
+  **Use cases:**
+  - Implement exponential backoff strategies
+  - Track retry attempts
+  - Trigger alerts for problematic messages
+  - Apply different processing logic based on retry count
+  
+  **Example values:** `1`, `3`, `5`
+</ResponseField>
+
+### X-Carrier-First-Receive-Time
+
+<ResponseField name="X-Carrier-First-Receive-Time" type="string">
+  The timestamp (in seconds since Unix epoch) when this message was first received from SQS.
+  
+  This corresponds to the SQS `ApproximateFirstReceiveTimestamp` attribute.
+  
+  **Use cases:**
+  - Calculate message age
+  - Implement time-based backoff strategies
+  - Track message latency
+  - Expire stale messages
+  
+  **Example values:** `1710004800`, `1710091200`
+</ResponseField>
+
+### Content-Type
+
+<ResponseField name="Content-Type" type="string" default="application/json">
+  The MIME type of the message body.
+  
+  This header is always sent with webhook requests. The value can be:
+  
+  1. **Dynamic:** Set per-message using the `Body.ContentType` SQS message attribute
+  2. **Configured:** Set globally via `CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE` environment variable
+  3. **Default:** `application/json` if neither is specified
+  
+  **Example values:** `application/json`, `application/xml`, `text/plain`
+</ResponseField>
+
+## Headers Received by Carrier
+
+Carrier processes specific headers from webhook responses to implement dynamic behavior.
+
+### Retry-After
+
+<ResponseField name="Retry-After" type="string">
+  Used with HTTP 429 (Too Many Requests) responses to specify when to retry the message.
+  
+  **Format:** Number of seconds to wait before retry
+  
+  When your webhook returns a 429 status with this header, Carrier will:
+  1. Parse the `Retry-After` value (in seconds)
+  2. Calculate a new SQS visibility timeout
+  3. Update the message visibility to prevent redelivery until after the specified time
+  
+  This enables distributed backoff without requiring complex client-side logic.
+  
+  **Example values:** `30`, `60`, `300`
+</ResponseField>
+
+## Example Webhook Requests
+
+### First Delivery
+
+When a message is delivered for the first time:
+
+```http
+POST /webhook HTTP/1.1
+Host: worker:9000
+Content-Type: application/json
+X-Carrier-Receive-Count: 1
+X-Carrier-First-Receive-Time: 1710004800
+Content-Length: 123
+
+{"event": "user.created", "userId": "12345"}
+```
+
+### Retry with Custom Content Type
+
+A message with a custom content type on its third attempt:
+
+```http
+POST /v1/events HTTP/1.1
+Host: api.example.com
+Content-Type: application/xml
+X-Carrier-Receive-Count: 3
+X-Carrier-First-Receive-Time: 1710004800
+Content-Length: 256
+
+<event><type>order.created</type><orderId>67890</orderId></event>
+```
+
+## Implementing Dynamic Backoff
+
+Here's how to implement a distributed exponential backoff strategy in your webhook handler:
+
+<CodeGroup>
+
+```go Go
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+    // Extract receive count from header
+    receiveCount := r.Header.Get("X-Carrier-Receive-Count")
+    count, _ := strconv.Atoi(receiveCount)
+    
+    // Process the message
+    err := processMessage(r.Body)
+    if err != nil {
+        // Calculate exponential backoff: 2^count seconds
+        backoffSeconds := int(math.Pow(2, float64(count)))
+        
+        // Return 429 with Retry-After header
+        w.Header().Set("Retry-After", strconv.Itoa(backoffSeconds))
+        w.WriteHeader(http.StatusTooManyRequests)
+        return
+    }
+    
+    w.WriteHeader(http.StatusOK)
+}
+```
+
+```python Python
+from flask import Flask, request, Response
+import math
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def handle_webhook():
+    # Extract receive count from header
+    receive_count = int(request.headers.get('X-Carrier-Receive-Count', 1))
+    
+    try:
+        # Process the message
+        process_message(request.data)
+        return Response(status=200)
+    except Exception as e:
+        # Calculate exponential backoff: 2^count seconds
+        backoff_seconds = int(math.pow(2, receive_count))
+        
+        # Return 429 with Retry-After header
+        return Response(
+            status=429,
+            headers={'Retry-After': str(backoff_seconds)}
+        )
+```
+
+```javascript Node.js
+const express = require('express');
+const app = express();
+
+app.post('/webhook', async (req, res) => {
+    // Extract receive count from header
+    const receiveCount = parseInt(
+        req.headers['x-carrier-receive-count'] || '1'
+    );
+    
+    try {
+        // Process the message
+        await processMessage(req.body);
+        res.status(200).send();
+    } catch (error) {
+        // Calculate exponential backoff: 2^count seconds
+        const backoffSeconds = Math.pow(2, receiveCount);
+        
+        // Return 429 with Retry-After header
+        res.set('Retry-After', backoffSeconds.toString());
+        res.status(429).send();
+    }
+});
+```
+
+</CodeGroup>
+
+## Tracking Message Age
+
+Calculate how long a message has been in the system:
+
+<CodeGroup>
+
+```go Go
+func getMessageAge(r *http.Request) time.Duration {
+    firstReceiveTimeStr := r.Header.Get("X-Carrier-First-Receive-Time")
+    firstReceiveTime, _ := strconv.ParseInt(firstReceiveTimeStr, 10, 64)
+    
+    messageTime := time.Unix(firstReceiveTime, 0)
+    return time.Since(messageTime)
+}
+
+// Example usage
+age := getMessageAge(r)
+if age > 1*time.Hour {
+    log.Printf("Warning: Message is %v old", age)
+}
+```
+
+```python Python
+import time
+from datetime import datetime, timedelta
+
+def get_message_age(request):
+    first_receive_time = int(
+        request.headers.get('X-Carrier-First-Receive-Time', 0)
+    )
+    message_time = datetime.fromtimestamp(first_receive_time)
+    return datetime.now() - message_time
+
+# Example usage
+age = get_message_age(request)
+if age > timedelta(hours=1):
+    print(f"Warning: Message is {age} old")
+```
+
+```javascript Node.js
+function getMessageAge(req) {
+    const firstReceiveTime = parseInt(
+        req.headers['x-carrier-first-receive-time'] || '0'
+    );
+    const messageTime = new Date(firstReceiveTime * 1000);
+    return Date.now() - messageTime.getTime();
+}
+
+// Example usage
+const age = getMessageAge(req);
+if (age > 3600000) { // 1 hour in milliseconds
+    console.log(`Warning: Message is ${age}ms old`);
+}
+```
+
+</CodeGroup>
+
+## Setting Dynamic Content Types
+
+To send messages with custom content types, use SQS message attributes:
+
+<CodeGroup>
+
+```python Python (boto3)
+import boto3
+
+sqs = boto3.client('sqs')
+
+# Send message with custom content type
+sqs.send_message(
+    QueueUrl='https://sqs.us-west-2.amazonaws.com/123456789/carrier-queue',
+    MessageBody='<xml><data>value</data></xml>',
+    MessageAttributes={
+        'Body.ContentType': {
+            'StringValue': 'application/xml',
+            'DataType': 'String'
+        }
+    }
+)
+```
+
+```javascript Node.js (AWS SDK)
+const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+
+const sqs = new SQSClient({ region: 'us-west-2' });
+
+// Send message with custom content type
+await sqs.send(new SendMessageCommand({
+    QueueUrl: 'https://sqs.us-west-2.amazonaws.com/123456789/carrier-queue',
+    MessageBody: '<xml><data>value</data></xml>',
+    MessageAttributes: {
+        'Body.ContentType': {
+            StringValue: 'application/xml',
+            DataType: 'String'
+        }
+    }
+}));
+```
+
+```go Go (AWS SDK)
+import (
+    "github.com/aws/aws-sdk-go-v2/service/sqs"
+    "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+)
+
+queueURL := "https://sqs.us-west-2.amazonaws.com/123456789/carrier-queue"
+messageBody := "<xml><data>value</data></xml>"
+contentType := "application/xml"
+
+// Send message with custom content type
+_, err := sqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
+    QueueUrl:    &queueURL,
+    MessageBody: &messageBody,
+    MessageAttributes: map[string]types.MessageAttributeValue{
+        "Body.ContentType": {
+            StringValue: &contentType,
+            DataType:    aws.String("String"),
+        },
+    },
+})
+```
+
+</CodeGroup>
+
+<Note>
+  The SQS message attribute name must be exactly `Body.ContentType` for Carrier to recognize it and set the `Content-Type` header dynamically.
+</Note>
+
+## Response Status Codes
+
+Carrier expects specific HTTP status codes from webhook endpoints:
+
+| Status Code | Behavior | Description |
+|-------------|----------|-------------|
+| `200 OK` | Message deleted from SQS | Successful processing |
+| `429 Too Many Requests` | Visibility timeout updated | Retry with backoff (requires `Retry-After` header) |
+| Other (4xx, 5xx) | Message returns to queue | Failed processing, message will retry based on SQS configuration |
+
+<Warning>
+  If you return `429` without a `Retry-After` header, Carrier will log an error and treat it as a failed transmission. The message will return to the queue after the standard visibility timeout.
+</Warning>
+
+## Best Practices
+
+1. **Always handle X-Carrier-Receive-Count**: Use this to implement intelligent retry strategies and prevent infinite loops
+
+2. **Return 429 with Retry-After for rate limiting**: This ensures proper backoff without losing messages
+
+3. **Monitor message age**: Use `X-Carrier-First-Receive-Time` to detect and handle stale messages
+
+4. **Set appropriate Content-Type**: Use SQS message attributes to specify content types for non-JSON payloads
+
+5. **Implement exponential backoff**: Use receive count to calculate increasing delays for retry attempts
+
+6. **Return 200 only on success**: Only return HTTP 200 when the message has been successfully processed and can be safely deleted

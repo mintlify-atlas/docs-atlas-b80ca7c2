@@ -1,0 +1,339 @@
+---
+title: Webhook Health Checks
+description: Monitor webhook endpoint health and automatically manage Carrier lifecycle
+---
+
+## Overview
+
+Carrier provides built-in health check monitoring for webhook endpoints. When enabled, Carrier will:
+
+- Wait for the webhook endpoint to come online before processing messages
+- Continuously monitor the webhook's health status
+- Automatically exit if the webhook goes offline, allowing orchestration systems like Kubernetes to restart the container
+
+This prevents messages from being unnecessarily sent to dead letter queues when services are starting up or experiencing issues.
+
+## Configuration
+
+Health checks are configured through environment variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT` | No | - | Enables health checks when set. Should be a full URL to your health check endpoint |
+| `CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL` | No | `60s` | Time interval between health checks |
+| `CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT` | No | `10s` | Timeout for each health check request |
+| `CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT` | No | `5` | Number of consecutive failed checks before marking webhook as offline |
+
+<Note>
+All time duration values support Go's `time.ParseDuration()` format (e.g., `30s`, `2m`, `1h30m`).
+</Note>
+
+## Example Configuration
+
+```yaml Docker Compose
+services:
+  carrier:
+    image: amplifysecurity/carrier
+    environment:
+      CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+      CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT: http://worker:9000/health
+      CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL: 30s
+      CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT: 5s
+      CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT: 3
+      CARRIER_SQS_ENDPOINT: https://sqs.us-west-2.amazonaws.com
+      CARRIER_SQS_QUEUE_NAME: my-queue
+```
+
+```yaml Kubernetes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carrier-demo
+spec:
+  template:
+    spec:
+      containers:
+        - name: carrier
+          image: amplifysecurity/carrier
+          env:
+            - name: CARRIER_WEBHOOK_ENDPOINT
+              value: http://localhost:9000/webhook
+            - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+              value: http://localhost:9000/health
+            - name: CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL
+              value: 30s
+```
+
+## How It Works
+
+### Health Check Mechanism
+
+The health checker (`transmitter/webhook/checker.go:76-93`) performs periodic GET requests to the configured endpoint:
+
+```go
+func (c *HealthChecker) checkEndpoint() (EndpointState, error) {
+    req, err := http.NewRequest(http.MethodGet, c.endpoint, nil)
+    if err != nil {
+        return EndpointStateOffline, err
+    }
+    resp, err := c.client.Do(req)
+    if resp != nil && resp.Body != nil {
+        defer resp.Body.Close()
+    }
+    if err != nil {
+        return EndpointStateOffline, err
+    }
+    if resp.StatusCode == http.StatusOK {
+        return EndpointStateOnline, nil
+    }
+    return EndpointStateOffline, fmt.Errorf("%w: %d", ErrNon200StatusCode, resp.StatusCode)
+}
+```
+
+<Info>
+The health checker only considers HTTP 200 responses as healthy. Any other status code or network error marks the endpoint as offline.
+</Info>
+
+### State Transitions
+
+Carrier manages two endpoint states defined in `transmitter/webhook/checker.go:13-16`:
+
+```go
+const (
+    // EndpointStateOnline represents an online endpoint.
+    EndpointStateOnline EndpointState = iota
+    // EndpointStateOffline represents an offline endpoint.
+    EndpointStateOffline
+)
+```
+
+#### Startup Sequence
+
+1. **Initial State**: Carrier starts with the endpoint in `EndpointStateOffline`
+2. **Waiting**: Health checks run continuously until the endpoint returns HTTP 200
+3. **Online**: Once healthy, Carrier logs "webhook online" and begins processing messages from SQS
+4. **Ready**: The message "carrier has arrived" indicates the system is fully operational
+
+```go
+if c.currentState == EndpointStateOffline {
+    // waiting for endpoint to initialize
+    if state == EndpointStateOnline {
+        c.log.Info("webhook online", "endpoint", c.webhookEndpoint)
+        c.currentState = state
+        c.offlineCount = 0
+        c.ctrl <- state
+        continue
+    }
+}
+```
+
+#### Runtime Monitoring
+
+Once online, the health checker:
+
+- Resets the offline counter on each successful check
+- Increments the counter on each failed check
+- Marks the endpoint offline after reaching the threshold
+- Signals Carrier to exit, triggering a container restart
+
+```go
+if state == EndpointStateOnline {
+    // reset the current offline count
+    c.offlineCount = 0
+    continue
+}
+c.offlineCount++
+if c.offlineCount >= c.offlineThresholdCount {
+    c.log.Warn("webhook offline", "endpoint", c.webhookEndpoint)
+    c.currentState = state
+    c.ctrl <- state
+}
+```
+
+## Implementing Health Check Endpoints
+
+### Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Keep It Simple" icon="gauge-simple-high">
+    Health checks should be fast and lightweight. Avoid database queries or external API calls.
+  </Card>
+  <Card title="Check Dependencies" icon="network-wired">
+    Verify that critical dependencies your webhook needs are available.
+  </Card>
+  <Card title="Return Quickly" icon="stopwatch">
+    Respond within the configured timeout (default 10s). Faster is better.
+  </Card>
+  <Card title="Use Standard Codes" icon="circle-check">
+    Return HTTP 200 for healthy, anything else for unhealthy.
+  </Card>
+</CardGroup>
+
+### Example Implementations
+
+<CodeGroup>
+```go Go
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+    // Simple health check
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("OK"))
+}
+
+// With dependency check
+func healthHandlerWithChecks(w http.ResponseWriter, r *http.Request) {
+    // Check database connection
+    if err := db.Ping(); err != nil {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        return
+    }
+    
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("OK"))
+}
+```
+
+```python Python
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    # Simple health check
+    return 'OK', 200
+
+@app.route('/health')
+def health_with_checks():
+    # Check dependencies
+    try:
+        db.ping()
+        return 'OK', 200
+    except Exception:
+        return 'Service Unavailable', 503
+```
+
+```javascript Node.js
+const express = require('express');
+const app = express();
+
+// Simple health check
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
+
+// With dependency check
+app.get('/health', async (req, res) => {
+    try {
+        await db.ping();
+        res.status(200).send('OK');
+    } catch (error) {
+        res.status(503).send('Service Unavailable');
+    }
+});
+```
+</CodeGroup>
+
+## Monitoring with StatLogger
+
+When health checks are enabled, you can monitor their operation using Carrier's statistics logging feature. Enable it by setting:
+
+```bash
+CARRIER_ENABLE_STAT_LOG=true
+```
+
+The StatLogger (from `main.go:42-78`) tracks goroutines and memory usage:
+
+```go
+type StatLogger struct {
+    ticker *time.Ticker
+    log    *slog.Logger
+    ctx    context.Context
+}
+
+func (l *StatLogger) Run() {
+    for {
+        select {
+        case <-l.ctx.Done():
+            return
+        case <-l.ticker.C:
+            var m runtime.MemStats
+            runtime.ReadMemStats(&m)
+            l.log.Info("stats", "goroutines", runtime.NumGoroutine(), "memory", humanize.Bytes(m.Sys))
+        }
+    }
+}
+```
+
+This helps you track resource usage and verify the health checker is running properly.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Carrier exits immediately on startup">
+    - Verify your health check endpoint is accessible from Carrier
+    - Check that the endpoint returns HTTP 200
+    - Review logs for connection errors
+    - Ensure the endpoint URL is correct (protocol, host, port, path)
+  </Accordion>
+  
+  <Accordion title="Health checks are too sensitive">
+    Increase the `CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT` to allow more consecutive failures before marking the endpoint offline. Default is 5 failures.
+  </Accordion>
+  
+  <Accordion title="Health checks are not frequent enough">
+    Decrease the `CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL` value. Default is 60 seconds. For faster detection, try 30s or 15s.
+  </Accordion>
+  
+  <Accordion title="Health checks timing out">
+    - Check network latency between Carrier and the webhook
+    - Optimize your health check endpoint to respond faster
+    - Increase `CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT` if necessary
+  </Accordion>
+</AccordionGroup>
+
+## Kubernetes Integration
+
+When running Carrier in Kubernetes, health checks work seamlessly with pod lifecycle management:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carrier-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: carrier
+          image: amplifysecurity/carrier
+          env:
+            - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+              value: http://localhost:9000/health
+            - name: CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT
+              value: "3"
+        - name: worker
+          image: my-worker:latest
+          ports:
+            - containerPort: 9000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+```
+
+<Warning>
+Carrier will exit when it detects the webhook is offline. Ensure your Kubernetes deployment has an appropriate restart policy (default is `Always`).
+</Warning>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" href="/operations/monitoring">
+    Learn about logging and monitoring Carrier in production
+  </Card>
+  <Card title="Configuration" href="/deployment/configuration">
+    Complete reference for all Carrier environment variables
+  </Card>
+</CardGroup>

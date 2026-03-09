@@ -1,0 +1,497 @@
+---
+title: Kubernetes Deployment
+description: Deploy Carrier as a sidecar container in Kubernetes pods
+---
+
+## Overview
+
+Carrier is designed to be deployed as a sidecar container in Kubernetes pods alongside your event worker applications. This deployment pattern follows the SQS event worker architecture, where Carrier handles message consumption from SQS and forwards them as webhooks to your application.
+
+## Basic Kubernetes Manifest
+
+Here's a complete example deploying Carrier as a sidecar in a Kubernetes pod. This example consumes messages from an SQS queue named `carrier-demo` in the `us-west-2` region for a worker that expects webhooks at `/webhook` on port `9000`:
+
+```yml
+---
+# SQS event worker pattern deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carrier-demo
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: carrier-demo
+  template:
+    metadata:
+      labels:
+        app: carrier-demo
+    spec:
+      serviceAccountName: carrier-demo
+      containers:
+        - name: carrier
+          image: amplifysecurity/carrier
+          securityContext:
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+          env:
+            - name: CARRIER_WEBHOOK_ENDPOINT
+              value: http://localhost:9000/webhook
+            - name: CARRIER_SQS_ENDPOINT
+              value: https://sqs.us-west-2.amazonaws.com
+            - name: CARRIER_SQS_QUEUE_NAME
+              value: carrier-demo
+        - name: worker
+          image: ${registry}/${container}:${tag}
+```
+
+<Note>
+  This example assumes that the Kubernetes service account `carrier-demo` is mapped to an IAM role that has the appropriate permissions to access the `carrier-demo` SQS queue.
+</Note>
+
+## Understanding the Sidecar Pattern
+
+### What is a Sidecar?
+
+A sidecar is a container that runs alongside your main application container in the same pod. In this pattern:
+
+- **Carrier (sidecar)**: Polls SQS and forwards messages as HTTP webhooks
+- **Worker (main application)**: Processes webhook events from Carrier
+
+Both containers share:
+- The same network namespace (communicate via `localhost`)
+- The same lifecycle (started and stopped together)
+- Pod-level resources and configuration
+
+### Benefits of the Sidecar Pattern
+
+1. **Separation of concerns**: Your application focuses on business logic, Carrier handles message polling
+2. **Lightweight**: Carrier image is under 8MB and uses less than 5MB RAM at idle
+3. **Scalable**: Scale pods horizontally to handle more messages
+4. **Language agnostic**: Your worker can be written in any language
+
+## IAM Roles and Service Accounts
+
+### AWS IAM Role Configuration
+
+Create an IAM role with permissions to access your SQS queue:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:carrier-demo"
+    }
+  ]
+}
+```
+
+### Service Account Annotation
+
+If using [IAM Roles for Service Accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html), annotate your service account:
+
+```yml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: carrier-demo
+  namespace: demo
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/carrier-demo-role
+```
+
+Then reference it in your deployment:
+
+```yml
+spec:
+  template:
+    spec:
+      serviceAccountName: carrier-demo
+```
+
+## Security Best Practices
+
+### Container Security Context
+
+The Carrier Docker image runs as a non-root user (UID 1000) by default. Enforce this in your Kubernetes deployment:
+
+```yml
+containers:
+  - name: carrier
+    image: amplifysecurity/carrier
+    securityContext:
+      runAsUser: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+```
+
+<Info>
+  The Carrier image is built `FROM scratch`, containing only the compiled binary and essential certificates, which minimizes the attack surface.
+</Info>
+
+### Pod Security Standards
+
+For enhanced security, configure pod-level security settings:
+
+```yml
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: carrier-demo
+      automountServiceAccountToken: true
+```
+
+### Network Policies
+
+Restrict network access to only what's necessary:
+
+```yml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: carrier-demo
+  namespace: demo
+spec:
+  podSelector:
+    matchLabels:
+      app: carrier-demo
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow AWS SQS
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+## Regional Configuration Examples
+
+### US East (N. Virginia) - us-east-1
+
+```yml
+env:
+  - name: CARRIER_SQS_ENDPOINT
+    value: https://sqs.us-east-1.amazonaws.com
+  - name: CARRIER_SQS_QUEUE_NAME
+    value: my-queue
+```
+
+### EU West (Ireland) - eu-west-1
+
+```yml
+env:
+  - name: CARRIER_SQS_ENDPOINT
+    value: https://sqs.eu-west-1.amazonaws.com
+  - name: CARRIER_SQS_QUEUE_NAME
+    value: my-queue
+```
+
+### Asia Pacific (Tokyo) - ap-northeast-1
+
+```yml
+env:
+  - name: CARRIER_SQS_ENDPOINT
+    value: https://sqs.ap-northeast-1.amazonaws.com
+  - name: CARRIER_SQS_QUEUE_NAME
+    value: my-queue
+```
+
+<Tip>
+  For a complete list of AWS SQS endpoints, see the [AWS Service Endpoints documentation](https://docs.aws.amazon.com/general/latest/gr/sqs-service.html).
+</Tip>
+
+## Advanced Configuration
+
+### Using ConfigMaps
+
+Store non-sensitive configuration in a ConfigMap:
+
+```yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: carrier-config
+  namespace: demo
+data:
+  SQS_ENDPOINT: https://sqs.us-west-2.amazonaws.com
+  SQS_QUEUE_NAME: carrier-demo
+  WEBHOOK_ENDPOINT: http://localhost:9000/webhook
+  WEBHOOK_REQUEST_TIMEOUT: 60s
+  SQS_BATCH_SIZE: "10"
+  SQS_RECEIVERS: "2"
+```
+
+Reference in your deployment:
+
+```yml
+containers:
+  - name: carrier
+    image: amplifysecurity/carrier
+    envFrom:
+      - configMapRef:
+          name: carrier-config
+        prefix: CARRIER_
+```
+
+### Health Check Configuration
+
+Ensure Carrier waits for your worker to be ready:
+
+```yml
+env:
+  - name: CARRIER_WEBHOOK_ENDPOINT
+    value: http://localhost:9000/webhook
+  - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+    value: http://localhost:9000/health
+  - name: CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL
+    value: 60s
+  - name: CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT
+    value: 10s
+  - name: CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT
+    value: "5"
+```
+
+### Resource Limits
+
+Carrier is lightweight, but you should still set resource limits:
+
+```yml
+containers:
+  - name: carrier
+    image: amplifysecurity/carrier
+    resources:
+      requests:
+        memory: "16Mi"
+        cpu: "50m"
+      limits:
+        memory: "64Mi"
+        cpu: "200m"
+```
+
+<Info>
+  At idle, Carrier consumes under 5MB of RAM. Adjust limits based on your message volume and batch size.
+</Info>
+
+### Liveness and Readiness Probes
+
+While Carrier doesn't expose health endpoints itself, you can monitor the worker:
+
+```yml
+containers:
+  - name: worker
+    image: ${registry}/${container}:${tag}
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 9000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 9000
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
+
+## Scaling
+
+### Horizontal Pod Autoscaling
+
+Scale based on CPU or custom metrics:
+
+```yml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: carrier-demo
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: carrier-demo
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+### Manual Scaling
+
+Scale the deployment manually:
+
+```bash
+kubectl scale deployment carrier-demo -n demo --replicas=5
+```
+
+## Complete Example with All Features
+
+```yml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: carrier-demo
+  namespace: demo
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/carrier-demo-role
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: carrier-config
+  namespace: demo
+data:
+  SQS_ENDPOINT: https://sqs.us-west-2.amazonaws.com
+  SQS_QUEUE_NAME: carrier-demo
+  SQS_BATCH_SIZE: "10"
+  SQS_RECEIVERS: "2"
+  SQS_RECEIVER_WORKERS: "10"
+  WEBHOOK_ENDPOINT: http://localhost:9000/webhook
+  WEBHOOK_HEALTH_CHECK_ENDPOINT: http://localhost:9000/health
+  WEBHOOK_REQUEST_TIMEOUT: 60s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carrier-demo
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: carrier-demo
+  template:
+    metadata:
+      labels:
+        app: carrier-demo
+    spec:
+      serviceAccountName: carrier-demo
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: carrier
+          image: amplifysecurity/carrier:latest
+          securityContext:
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - configMapRef:
+                name: carrier-config
+              prefix: CARRIER_
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "200m"
+        - name: worker
+          image: ${registry}/${container}:${tag}
+          ports:
+            - containerPort: 9000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+```
+
+## Troubleshooting
+
+### Check Pod Status
+
+```bash
+kubectl get pods -n demo -l app=carrier-demo
+```
+
+### View Carrier Logs
+
+```bash
+kubectl logs -n demo -l app=carrier-demo -c carrier -f
+```
+
+### View Worker Logs
+
+```bash
+kubectl logs -n demo -l app=carrier-demo -c worker -f
+```
+
+### Verify IAM Role
+
+```bash
+kubectl describe sa carrier-demo -n demo
+```
+
+### Debug Network Connectivity
+
+Exec into the pod to test connectivity:
+
+```bash
+kubectl exec -n demo -it <pod-name> -c carrier -- /bin/sh
+```
+
+<Warning>
+  The Carrier container is built `FROM scratch` and doesn't include a shell. Use the worker container for debugging instead.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration Reference" icon="gear" href="/deployment/configuration">
+    Complete list of all configuration options
+  </Card>
+  <Card title="Docker Compose" icon="docker" href="/deployment/docker-compose">
+    Run Carrier locally for development
+  </Card>
+</CardGroup>

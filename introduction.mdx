@@ -1,0 +1,116 @@
+---
+title: Introduction
+description: A lightweight messaging adapter for webhooks designed for the SQS event worker pattern
+---
+
+## What is Carrier?
+
+Carrier is a lightweight messaging adapter written in Go that bridges AWS SQS queues to webhook endpoints. It's designed as a sidecar container for the SQS event worker pattern, making it perfect for Kubernetes deployments where you need to convert SQS messages into HTTP webhooks for your application.
+
+<CardGroup cols={2}>
+  <Card title="Tiny Footprint" icon="feather">
+    Under 8MB Docker image with less than 5MB RAM usage at idle
+  </Card>
+  <Card title="Production Ready" icon="shield-check">
+    Built-in health monitoring and graceful shutdown handling
+  </Card>
+  <Card title="Flexible Delivery" icon="gauge">
+    Dynamic visibility timeouts and configurable concurrency
+  </Card>
+  <Card title="Simple Setup" icon="rocket">
+    Environment variable configuration, no complex setup needed
+  </Card>
+</CardGroup>
+
+## Why Carrier?
+
+Carrier was built to address limitations in existing SQS event worker daemons:
+
+- **Lightweight**: Unlike alternatives that bundle heavy frameworks (JDK, Node.js), Carrier is a simple Go binary with minimal dependencies
+- **Feature Complete**: Supports advanced features like dynamic visibility timeouts with publicly available Docker images
+- **Future Proof**: Designed with extensibility in mind to support multiple messaging systems beyond SQS
+
+<Note>
+  Carrier is named after the Protoss Carrier unit from StarCraft. Think of your carrier fleet ferrying messages to your application!
+</Note>
+
+## Key Features
+
+### SQS to Webhook Adapter
+
+Carrier receives messages from AWS SQS and forwards them as HTTP POST requests to your webhook endpoint. Each message is delivered individually with configurable concurrency and batch settings.
+
+### Health Monitoring
+
+Carrier can monitor your webhook endpoint's health before processing messages. This prevents scenarios where messages fail repeatedly before your service is ready, avoiding unnecessary dead letter queue traffic.
+
+<Note>
+  When health checks are enabled, Carrier waits for your webhook to come online before processing messages and exits if the webhook goes offline.
+</Note>
+
+### Dynamic Visibility Timeouts
+
+Implement distributed backoff strategies by having your worker return `429 Too Many Requests` with a `Retry-After` header. Carrier automatically adjusts the SQS visibility timeout to prevent the message from being redelivered until the specified time.
+
+Carrier sends helpful headers with each webhook:
+
+- `X-Carrier-Receive-Count`: Number of times the message has been received
+- `X-Carrier-First-Receive-Time`: Timestamp of first receive (seconds since epoch)
+
+### Flexible Content Types
+
+Carrier supports both dynamic and static `Content-Type` headers:
+
+- **Dynamic**: Send an SQS message attribute named `Body.ContentType` (Type: String) to set the content type per message
+- **Static**: Configure a default using the `CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE` environment variable
+
+## Use Cases
+
+### Kubernetes Event Workers
+
+Deploy Carrier as a sidecar container alongside your application workers. Carrier handles all SQS polling and message delivery, letting your application focus on processing webhooks.
+
+```yaml
+containers:
+  - name: carrier
+    image: amplifysecurity/carrier
+    env:
+      - name: CARRIER_WEBHOOK_ENDPOINT
+        value: http://localhost:9000/webhook
+      - name: CARRIER_SQS_QUEUE_NAME
+        value: my-queue
+  - name: worker
+    image: my-app:latest
+```
+
+### Local Development
+
+Use Carrier in Docker Compose stacks with local SQS alternatives like `alpine-sqs` for testing event-driven workflows without AWS infrastructure.
+
+### Microservices Integration
+
+Connect SQS-based messaging systems to HTTP-based microservices without modifying application code or adding AWS SDK dependencies.
+
+## Architecture
+
+Carrier separates concerns between receivers and transmitters:
+
+- **Receivers**: Pull messages from messaging systems (currently SQS)
+- **Transmitters**: Send messages to endpoints (currently HTTP webhooks)
+
+This architecture enables future support for additional messaging systems and transmission methods beyond SQS and HTTP.
+
+## Comparison to Alternatives
+
+Carrier improves upon existing SQS daemon implementations:
+
+- [`mozart-analytics/sqsd`](https://github.com/mozart-analytics/sqsd) - JDK-based, larger image size
+- [`mogadanez/sqsd`](https://github.com/mogadanez/sqsd) - Node.js-based, larger footprint
+- [`fterrag/simple-sqsd`](https://github.com/fterrag/simple-sqsd) - Missing some advanced features
+
+Carrier provides the same functionality with:
+
+- Smaller container image (less than 8MB vs 100MB+)
+- Lower memory footprint (less than 5MB at idle)
+- All features with publicly available Docker images
+- Built-in health checking and monitoring

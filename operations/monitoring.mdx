@@ -1,0 +1,554 @@
+---
+title: Monitoring & Observability
+description: Configure logging, statistics tracking, and production monitoring for Carrier
+---
+
+## Overview
+
+Carrier provides comprehensive logging and monitoring capabilities to help you track message processing, resource usage, and system health in production environments.
+
+<CardGroup cols={2}>
+  <Card title="JSON Logging" icon="file-code">
+    Structured logs for easy parsing and analysis
+  </Card>
+  <Card title="Colorized Output" icon="palette">
+    Human-friendly logs for local development
+  </Card>
+  <Card title="Statistics Tracking" icon="chart-line">
+    Periodic resource usage reports
+  </Card>
+  <Card title="Source Attribution" icon="tag">
+    Every log includes component identification
+  </Card>
+</CardGroup>
+
+## Logging Configuration
+
+Carrier supports two logging formats controlled by environment variables:
+
+### JSON Logging (Production)
+
+Default format for production environments. Each log entry is a valid JSON object:
+
+```bash
+CARRIER_ENABLE_COLORIZED_LOGGING=false  # Default
+```
+
+**Example output:**
+```json
+{"time":"2024-03-09T10:15:30Z","level":"INFO","source":"sqs.Receiver","msg":"starting event loop","batch_size":10,"max_workers":10}
+{"time":"2024-03-09T10:15:31Z","level":"INFO","source":"webhook.HealthChecker","msg":"webhook online","endpoint":"http://worker:9000"}
+{"time":"2024-03-09T10:15:31Z","level":"INFO","source":"main","msg":"carrier has arrived"}
+{"time":"2024-03-09T10:15:35Z","level":"DEBUG","source":"sqs.Receiver","msg":"received messages","count":5}
+{"time":"2024-03-09T10:15:36Z","level":"DEBUG","source":"sqs.Receiver","msg":"deleted messages","count":5}
+```
+
+### Colorized Logging (Development)
+
+Human-friendly format for local development and debugging:
+
+```bash
+CARRIER_ENABLE_COLORIZED_LOGGING=true
+```
+
+**Example output:**
+```
+10:15:30 INF starting event loop source=sqs.Receiver batch_size=10 max_workers=10
+10:15:31 INF webhook online source=webhook.HealthChecker endpoint=http://worker:9000
+10:15:31 INF carrier has arrived source=main
+10:15:35 DBG received messages source=sqs.Receiver count=5
+10:15:36 DBG deleted messages source=sqs.Receiver count=5
+```
+
+### Implementation
+
+Logging is configured in `main.go:84-92`:
+
+```go
+if envCfg.EnableColorizedLogging {
+    logHandler = tint.NewHandler(os.Stdout, &tint.Options{Level: slog.LevelInfo})
+} else {
+    logHandler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+}
+log := slog.New(logHandler).With("source", "main")
+```
+
+All components use Go's structured logging (`slog`) with source attribution:
+
+```go
+log := slog.New(logHandler).With("source", "sqs.Receiver")
+log.Info("starting event loop", "batch_size", batchSize, "max_workers", maxWorkers)
+```
+
+## Statistics Logging
+
+Enable periodic statistics reporting to track resource usage:
+
+```bash
+CARRIER_ENABLE_STAT_LOG=true
+CARRIER_STAT_LOG_TIMER=120s  # Default: every 2 minutes
+```
+
+### StatLogger Implementation
+
+The StatLogger component (`main.go:42-78`) tracks goroutines and memory usage:
+
+```go
+// StatLogger is a utility for logging runtime statistics.
+type StatLogger struct {
+    ticker *time.Ticker
+    log    *slog.Logger
+    ctx    context.Context
+}
+
+// Run executes the execution loop of the StatLogger.
+func (l *StatLogger) Run() {
+    for {
+        select {
+        case <-l.ctx.Done():
+            return
+        case <-l.ticker.C:
+            var m runtime.MemStats
+            runtime.ReadMemStats(&m)
+            l.log.Info("stats", "goroutines", runtime.NumGoroutine(), "memory", humanize.Bytes(m.Sys))
+        }
+    }
+}
+```
+
+### Stats Output Example
+
+**JSON format:**
+```json
+{"time":"2024-03-09T10:15:30Z","level":"INFO","source":"main.StatLogger","msg":"stats","goroutines":15,"memory":"12 MB"}
+{"time":"2024-03-09T10:17:30Z","level":"INFO","source":"main.StatLogger","msg":"stats","goroutines":15,"memory":"12 MB"}
+{"time":"2024-03-09T10:19:30Z","level":"INFO","source":"main.StatLogger","msg":"stats","goroutines":18,"memory":"13 MB"}
+```
+
+**Colorized format:**
+```
+10:15:30 INF stats source=main.StatLogger goroutines=15 memory="12 MB"
+10:17:30 INF stats source=main.StatLogger goroutines=15 memory="12 MB"
+10:19:30 INF stats source=main.StatLogger goroutines=18 memory="13 MB"
+```
+
+<Info>
+The StatLogger uses the [`humanize`](https://github.com/dustin/go-humanize) library to format memory sizes in human-readable units (MB, GB, etc.).
+</Info>
+
+## Log Levels and Sources
+
+### Log Levels
+
+Carrier uses standard log levels:
+
+| Level | Usage | Examples |
+|-------|-------|----------|
+| `INFO` | Normal operation events | Startup, shutdown, state changes |
+| `WARN` | Potential issues | Webhook offline, configuration warnings |
+| `ERROR` | Error conditions | Failed API calls, transmission failures |
+| `DEBUG` | Detailed diagnostics | Message counts, batch operations |
+
+### Log Sources
+
+Each log entry includes a `source` field identifying the component:
+
+| Source | Component | Purpose |
+|--------|-----------|----------|
+| `main` | Main process | Startup, shutdown, configuration |
+| `main.StatLogger` | Statistics logger | Resource usage tracking |
+| `sqs.Receiver` | SQS receiver | Message polling and processing |
+| `webhook.Transmitter` | HTTP transmitter | Webhook delivery (logged at debug level in errors) |
+| `webhook.HealthChecker` | Health checker | Endpoint health monitoring |
+
+## Production Monitoring Setup
+
+### Docker Compose Example
+
+```yaml
+version: '3.8'
+
+services:
+  carrier:
+    image: amplifysecurity/carrier
+    environment:
+      # Logging configuration
+      CARRIER_ENABLE_COLORIZED_LOGGING: "false"
+      CARRIER_ENABLE_STAT_LOG: "true"
+      CARRIER_STAT_LOG_TIMER: "60s"
+      
+      # SQS configuration
+      CARRIER_SQS_ENDPOINT: "https://sqs.us-west-2.amazonaws.com"
+      CARRIER_SQS_QUEUE_NAME: "my-queue"
+      CARRIER_SQS_BATCH_SIZE: "10"
+      
+      # Webhook configuration
+      CARRIER_WEBHOOK_ENDPOINT: "http://worker:9000/webhook"
+      CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT: "http://worker:9000/health"
+    
+    # Send logs to stdout for container log collection
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker:
+    image: my-worker:latest
+```
+
+### Kubernetes Example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carrier-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: carrier
+          image: amplifysecurity/carrier
+          env:
+            - name: CARRIER_ENABLE_COLORIZED_LOGGING
+              value: "false"
+            - name: CARRIER_ENABLE_STAT_LOG
+              value: "true"
+            - name: CARRIER_STAT_LOG_TIMER
+              value: "60s"
+            - name: CARRIER_SQS_ENDPOINT
+              value: "https://sqs.us-west-2.amazonaws.com"
+            - name: CARRIER_SQS_QUEUE_NAME
+              value: "my-queue"
+            - name: CARRIER_WEBHOOK_ENDPOINT
+              value: "http://localhost:9000/webhook"
+            - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+              value: "http://localhost:9000/health"
+          
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+        
+        - name: worker
+          image: my-worker:latest
+```
+
+## Integration with Monitoring Tools
+
+### CloudWatch Logs
+
+When running on AWS ECS or EKS, logs are automatically sent to CloudWatch:
+
+```json
+// Log Insights query to track message throughput
+fields @timestamp, source, msg, count
+| filter source = "sqs.Receiver" and msg = "deleted messages"
+| stats sum(count) as total_messages by bin(5m)
+```
+
+```json
+// Query to monitor resource usage
+fields @timestamp, goroutines, memory
+| filter source = "main.StatLogger"
+| sort @timestamp desc
+```
+
+### Datadog
+
+Configure the Datadog Agent to parse Carrier's JSON logs:
+
+```yaml
+logs:
+  - type: file
+    path: "/var/log/containers/*carrier*.log"
+    service: carrier
+    source: golang
+    sourcecategory: sourcecode
+```
+
+**Example Datadog monitor:**
+```
+# Alert on high message processing errors
+avg(last_5m):sum:carrier.message.errors{*} > 10
+```
+
+### Prometheus
+
+While Carrier doesn't expose metrics directly, you can use a log-to-metrics exporter:
+
+```yaml
+# mtail configuration example
+program carrier {
+  /"msg":"deleted messages","count":(\d+)/ {
+    carrier_messages_processed_total += $1
+  }
+  
+  /"msg":"failed to transmit message"/ {
+    carrier_message_errors_total++
+  }
+  
+  /"msg":"stats","goroutines":(\d+),"memory":"([\d.]+)\s+(\w+)"/ {
+    carrier_goroutines = $1
+  }
+}
+```
+
+### Grafana Loki
+
+Query Carrier logs in Loki:
+
+```logql
+{container="carrier"} | json
+```
+
+```logql
+# Count messages processed per minute
+sum(rate({container="carrier"} 
+  | json 
+  | source="sqs.Receiver" 
+  | msg="deleted messages" [1m])) by (count)
+```
+
+### Elasticsearch (ELK Stack)
+
+Index Carrier logs with Filebeat:
+
+```yaml
+filebeat.inputs:
+  - type: container
+    paths:
+      - '/var/lib/docker/containers/*/*.log'
+    processors:
+      - add_kubernetes_metadata:
+          host: ${NODE_NAME}
+          matchers:
+          - logs_path:
+              logs_path: "/var/lib/docker/containers/"
+
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+```
+
+**Kibana query:**
+```
+source:"sqs.Receiver" AND msg:"deleted messages"
+```
+
+## Key Metrics to Monitor
+
+<CardGroup cols={2}>
+  <Card title="Message Throughput" icon="gauge-high">
+    Track `deleted messages` count to measure successful processing rate
+  </Card>
+  <Card title="Error Rate" icon="triangle-exclamation">
+    Monitor `failed to transmit message` errors for processing issues
+  </Card>
+  <Card title="Memory Usage" icon="memory">
+    Watch `memory` values in stats logs for memory leaks
+  </Card>
+  <Card title="Goroutine Count" icon="layer-group">
+    Track `goroutines` to detect goroutine leaks
+  </Card>
+  <Card title="Health Status" icon="heart-pulse">
+    Monitor `webhook online/offline` events for service health
+  </Card>
+  <Card title="Visibility Updates" icon="clock">
+    Track `updated message visibility` for retry pattern analysis
+  </Card>
+</CardGroup>
+
+### Sample Monitoring Queries
+
+<Tabs>
+  <Tab title="Message Processing">
+    ```json CloudWatch Logs Insights
+    // Total messages processed in last hour
+    fields @timestamp, count
+    | filter source = "sqs.Receiver" and msg = "deleted messages"
+    | stats sum(count) as total
+    ```
+    
+    ```logql Loki
+    sum(count_over_time({container="carrier"} 
+      | json 
+      | source="sqs.Receiver" 
+      | msg="deleted messages" [1h]))
+    ```
+  </Tab>
+  
+  <Tab title="Error Tracking">
+    ```json CloudWatch Logs Insights
+    // Errors in last 15 minutes
+    fields @timestamp, level, msg, error
+    | filter level = "ERROR"
+    | sort @timestamp desc
+    | limit 100
+    ```
+    
+    ```logql Loki
+    {container="carrier"} 
+      | json 
+      | level="ERROR"
+    ```
+  </Tab>
+  
+  <Tab title="Resource Usage">
+    ```json CloudWatch Logs Insights
+    // Memory and goroutine trends
+    fields @timestamp, goroutines, memory
+    | filter source = "main.StatLogger"
+    | sort @timestamp desc
+    ```
+    
+    ```logql Loki
+    {container="carrier"} 
+      | json 
+      | source="main.StatLogger"
+    ```
+  </Tab>
+  
+  <Tab title="Health Events">
+    ```json CloudWatch Logs Insights
+    // Webhook state changes
+    fields @timestamp, msg, endpoint
+    | filter source = "webhook.HealthChecker" 
+      and (msg = "webhook online" or msg = "webhook offline")
+    | sort @timestamp desc
+    ```
+    
+    ```logql Loki
+    {container="carrier"} 
+      | json 
+      | source="webhook.HealthChecker" 
+      | msg=~"webhook (online|offline)"
+    ```
+  </Tab>
+</Tabs>
+
+## Alerting Recommendations
+
+<AccordionGroup>
+  <Accordion title="High Error Rate">
+    **Condition**: More than 5 transmission errors in 5 minutes
+    
+    **Action**: 
+    - Check webhook service health
+    - Review recent code deployments
+    - Verify network connectivity
+    
+    **Query**:
+    ```
+    count({container="carrier"} | json | level="ERROR" | msg=~"failed to transmit") > 5
+    ```
+  </Accordion>
+  
+  <Accordion title="Webhook Offline">
+    **Condition**: Webhook marked as offline
+    
+    **Action**:
+    - Check worker service status
+    - Review worker logs for errors
+    - Verify health check endpoint
+    
+    **Query**:
+    ```
+    {container="carrier"} | json | msg="webhook offline"
+    ```
+  </Accordion>
+  
+  <Accordion title="Memory Growth">
+    **Condition**: Memory usage increasing over time
+    
+    **Action**:
+    - Review memory stats trends
+    - Check for message processing backlog
+    - Consider restarting the container
+    
+    **Query**:
+    ```
+    avg_over_time({container="carrier"} 
+      | json 
+      | source="main.StatLogger" 
+      | unwrap memory [30m])
+    ```
+  </Accordion>
+  
+  <Accordion title="Goroutine Leak">
+    **Condition**: Goroutine count continuously increasing
+    
+    **Action**:
+    - Check for stuck message processing
+    - Review recent configuration changes
+    - Restart the container if count exceeds threshold
+    
+    **Query**:
+    ```
+    rate({container="carrier"} 
+      | json 
+      | source="main.StatLogger" 
+      | unwrap goroutines [10m]) > 0
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Use JSON in Production" icon="file-code">
+    Always use JSON logging (`CARRIER_ENABLE_COLORIZED_LOGGING=false`) in production for better parsing and analysis.
+  </Card>
+  <Card title="Enable Stats Logging" icon="chart-line">
+    Set `CARRIER_ENABLE_STAT_LOG=true` to track resource usage trends over time.
+  </Card>
+  <Card title="Configure Log Rotation" icon="rotate">
+    Use container logging drivers with size and file limits to prevent disk space issues.
+  </Card>
+  <Card title="Correlate Logs" icon="link">
+    Use message IDs from SQS to correlate logs across Carrier and your worker application.
+  </Card>
+  <Card title="Set Up Alerts" icon="bell">
+    Create alerts for error rates, webhook offline events, and resource anomalies.
+  </Card>
+  <Card title="Monitor Trends" icon="chart-area">
+    Track message throughput, error rates, and resource usage trends over time.
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+### No Logs Appearing
+
+- Verify logs are being written to stdout: `docker logs <container>`
+- Check log aggregation configuration
+- Ensure JSON parsing is configured correctly
+
+### Missing Stats Logs
+
+- Confirm `CARRIER_ENABLE_STAT_LOG=true`
+- Check `CARRIER_STAT_LOG_TIMER` value
+- Verify the StatLogger goroutine is running
+
+### Log Volume Too High
+
+- Increase `CARRIER_STAT_LOG_TIMER` for less frequent stats
+- Filter out debug-level logs in your aggregation tool
+- Increase batch size to reduce per-message log entries
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Health Checks" href="/operations/health-checks">
+    Configure webhook health monitoring
+  </Card>
+  <Card title="Dynamic Timeouts" href="/operations/dynamic-visibility-timeouts">
+    Implement intelligent retry strategies
+  </Card>
+  <Card title="Configuration" href="/deployment/configuration">
+    Complete environment variable reference
+  </Card>
+</CardGroup>

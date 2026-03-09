@@ -1,0 +1,484 @@
+---
+title: Configuration Reference
+description: Complete guide to all Carrier configuration options
+---
+
+## Overview
+
+Carrier is configured entirely through environment variables. All configuration options are prefixed with `CARRIER_` and can be set in your deployment manifest, Docker Compose file, or shell environment.
+
+## Configuration Categories
+
+<CardGroup cols={2}>
+  <Card title="SQS Configuration" icon="aws">
+    Queue connection and polling settings
+  </Card>
+  <Card title="Webhook Configuration" icon="webhook">
+    HTTP endpoint and request settings
+  </Card>
+  <Card title="Health Check Configuration" icon="heart-pulse">
+    Worker availability monitoring
+  </Card>
+  <Card title="Logging Configuration" icon="terminal">
+    Log output and statistics
+  </Card>
+</CardGroup>
+
+## SQS Configuration
+
+Configure how Carrier connects to and polls messages from AWS SQS.
+
+### CARRIER_SQS_ENDPOINT
+
+<ParamField path="CARRIER_SQS_ENDPOINT" type="string" required>
+  The endpoint for the SQS service.
+</ParamField>
+
+**Examples:**
+
+<CodeGroup>
+```bash Production (us-west-2)
+CARRIER_SQS_ENDPOINT=https://sqs.us-west-2.amazonaws.com
+```
+
+```bash Production (us-east-1)
+CARRIER_SQS_ENDPOINT=https://sqs.us-east-1.amazonaws.com
+```
+
+```bash Local Development
+CARRIER_SQS_ENDPOINT=http://sqs:9324
+```
+</CodeGroup>
+
+<Tip>
+  For a complete list of AWS SQS endpoints by region, see the [AWS Service Endpoints documentation](https://docs.aws.amazon.com/general/latest/gr/sqs-service.html).
+</Tip>
+
+### CARRIER_SQS_QUEUE_NAME
+
+<ParamField path="CARRIER_SQS_QUEUE_NAME" type="string" required>
+  The name of the SQS queue to consume messages from.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_SQS_QUEUE_NAME=my-events-queue
+```
+
+### CARRIER_SQS_BATCH_SIZE
+
+<ParamField path="CARRIER_SQS_BATCH_SIZE" type="integer" default="1">
+  The number of messages each SQS receiver will request from SQS in a single poll.
+</ParamField>
+
+Valid range: `1` to `10` (AWS SQS maximum)
+
+**Example:**
+```bash
+CARRIER_SQS_BATCH_SIZE=10
+```
+
+<Note>
+  All webhooks are transmitted one message per HTTP request, even when batch size is greater than 1.
+</Note>
+
+### CARRIER_SQS_RECEIVERS
+
+<ParamField path="CARRIER_SQS_RECEIVERS" type="integer" default="1">
+  The number of concurrent SQS receivers requesting messages from SQS.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_SQS_RECEIVERS=2
+```
+
+<Info>
+  Each receiver runs in its own goroutine and polls SQS independently. Increase this value to poll more aggressively.
+</Info>
+
+### CARRIER_SQS_RECEIVER_WORKERS
+
+<ParamField path="CARRIER_SQS_RECEIVER_WORKERS" type="integer" default="1">
+  The number of concurrent workers transmitting messages as webhooks for each receiver.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_SQS_RECEIVER_WORKERS=10
+```
+
+<Tip>
+  A common pattern is to set `CARRIER_SQS_BATCH_SIZE` and `CARRIER_SQS_RECEIVER_WORKERS` to the same value. This causes all messages in a batch to be transmitted in parallel HTTP requests.
+</Tip>
+
+## Webhook Configuration
+
+Configure how Carrier sends HTTP POST requests to your application.
+
+### CARRIER_WEBHOOK_ENDPOINT
+
+<ParamField path="CARRIER_WEBHOOK_ENDPOINT" type="string" default="http://localhost:9000">
+  The full URL, including protocol and path, where webhooks will be sent.
+</ParamField>
+
+**Examples:**
+
+<CodeGroup>
+```bash Kubernetes (same pod)
+CARRIER_WEBHOOK_ENDPOINT=http://localhost:9000/webhook
+```
+
+```bash Docker Compose
+CARRIER_WEBHOOK_ENDPOINT=http://worker:9000/webhook
+```
+
+```bash Custom Path
+CARRIER_WEBHOOK_ENDPOINT=http://localhost:8080/v1/events
+```
+</CodeGroup>
+
+### CARRIER_WEBHOOK_REQUEST_TIMEOUT
+
+<ParamField path="CARRIER_WEBHOOK_REQUEST_TIMEOUT" type="duration" default="60s">
+  The timeout for webhook HTTP requests.
+</ParamField>
+
+Accepts any valid Go duration string (e.g., `30s`, `1m`, `500ms`).
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_REQUEST_TIMEOUT=30s
+```
+
+### CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE
+
+<ParamField path="CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE" type="string" default="application/json">
+  The default value sent in the `Content-Type` header for all webhook POST requests.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE=application/json
+```
+
+<Info>
+  This can be overridden per-message by sending an SQS message attribute named `Body.ContentType`. See the [Dynamic Content-Type](/essentials/features#dynamic-content-type) documentation for details.
+</Info>
+
+### CARRIER_WEBHOOK_TLS_INSECURE_SKIP_VERIFY
+
+<ParamField path="CARRIER_WEBHOOK_TLS_INSECURE_SKIP_VERIFY" type="boolean" default="false">
+  When set to `true`, the webhook transmitter will not validate TLS certificates for HTTPS endpoints.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_TLS_INSECURE_SKIP_VERIFY=true
+```
+
+<Warning>
+  Only use this in development or testing environments. Never disable TLS verification in production.
+</Warning>
+
+## Health Check Configuration
+
+Carrier can monitor your worker's availability and wait for it to be ready before processing messages.
+
+### CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+
+<ParamField path="CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT" type="string">
+  When set, enables health check functionality using the provided endpoint.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT=http://localhost:9000/health
+```
+
+<Info>
+  When configured, Carrier will:
+  - Wait for this endpoint to respond successfully before processing messages
+  - Exit if the endpoint becomes unavailable (useful for Kubernetes restarts)
+</Info>
+
+### CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL
+
+<ParamField path="CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL" type="duration" default="60s">
+  The time interval between webhook health checks.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL=30s
+```
+
+### CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT
+
+<ParamField path="CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT" type="duration" default="10s">
+  The timeout for health check requests.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT=5s
+```
+
+### CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT
+
+<ParamField path="CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT" type="integer" default="5">
+  The number of consecutive failed health checks before the webhook is determined to be offline.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT=3
+```
+
+## Logging Configuration
+
+Control Carrier's log output and statistics reporting.
+
+### CARRIER_ENABLE_COLORIZED_LOGGING
+
+<ParamField path="CARRIER_ENABLE_COLORIZED_LOGGING" type="boolean" default="false">
+  When set to `true`, enables colorized log messages for terminal output.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_ENABLE_COLORIZED_LOGGING=true
+```
+
+<Tip>
+  Enable this for local development in Docker Compose. Keep it disabled in production Kubernetes deployments where logs are collected by log aggregation systems.
+</Tip>
+
+### CARRIER_ENABLE_STAT_LOG
+
+<ParamField path="CARRIER_ENABLE_STAT_LOG" type="boolean" default="false">
+  When set to `true`, enables periodic statistics log messages.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_ENABLE_STAT_LOG=true
+```
+
+Statistics include:
+- Number of active goroutines
+- Memory usage
+
+### CARRIER_STAT_LOG_TIMER
+
+<ParamField path="CARRIER_STAT_LOG_TIMER" type="duration" default="120s">
+  The interval between statistics log messages.
+</ParamField>
+
+**Example:**
+```bash
+CARRIER_STAT_LOG_TIMER=60s
+```
+
+## Configuration Examples
+
+### Development Setup
+
+<Tabs>
+  <Tab title="Docker Compose">
+    ```yml
+    environment:
+      # Required
+      CARRIER_WEBHOOK_ENDPOINT: http://worker:9000/webhook
+      CARRIER_SQS_ENDPOINT: http://sqs:9324
+      CARRIER_SQS_QUEUE_NAME: default
+      
+      # Development features
+      CARRIER_ENABLE_COLORIZED_LOGGING: "true"
+      CARRIER_ENABLE_STAT_LOG: "true"
+      CARRIER_STAT_LOG_TIMER: 30s
+    ```
+  </Tab>
+  
+  <Tab title="Shell Export">
+    ```bash
+    export CARRIER_WEBHOOK_ENDPOINT=http://localhost:9000/webhook
+    export CARRIER_SQS_ENDPOINT=http://localhost:9324
+    export CARRIER_SQS_QUEUE_NAME=default
+    export CARRIER_ENABLE_COLORIZED_LOGGING=true
+    export CARRIER_ENABLE_STAT_LOG=true
+    ```
+  </Tab>
+</Tabs>
+
+### Production Kubernetes
+
+<Tabs>
+  <Tab title="ConfigMap">
+    ```yml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: carrier-config
+    data:
+      SQS_ENDPOINT: https://sqs.us-west-2.amazonaws.com
+      SQS_QUEUE_NAME: production-events
+      SQS_BATCH_SIZE: "10"
+      SQS_RECEIVERS: "2"
+      SQS_RECEIVER_WORKERS: "10"
+      WEBHOOK_ENDPOINT: http://localhost:9000/webhook
+      WEBHOOK_HEALTH_CHECK_ENDPOINT: http://localhost:9000/health
+      WEBHOOK_REQUEST_TIMEOUT: 60s
+    ```
+  </Tab>
+  
+  <Tab title="Deployment Env">
+    ```yml
+    env:
+      - name: CARRIER_SQS_ENDPOINT
+        value: https://sqs.us-west-2.amazonaws.com
+      - name: CARRIER_SQS_QUEUE_NAME
+        value: production-events
+      - name: CARRIER_SQS_BATCH_SIZE
+        value: "10"
+      - name: CARRIER_SQS_RECEIVERS
+        value: "2"
+      - name: CARRIER_SQS_RECEIVER_WORKERS
+        value: "10"
+      - name: CARRIER_WEBHOOK_ENDPOINT
+        value: http://localhost:9000/webhook
+      - name: CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT
+        value: http://localhost:9000/health
+    ```
+  </Tab>
+</Tabs>
+
+### High Throughput
+
+Optimized for processing many messages quickly:
+
+```bash
+# SQS Configuration
+CARRIER_SQS_ENDPOINT=https://sqs.us-west-2.amazonaws.com
+CARRIER_SQS_QUEUE_NAME=high-volume-queue
+CARRIER_SQS_BATCH_SIZE=10
+CARRIER_SQS_RECEIVERS=4
+CARRIER_SQS_RECEIVER_WORKERS=10
+
+# Webhook Configuration
+CARRIER_WEBHOOK_ENDPOINT=http://localhost:9000/webhook
+CARRIER_WEBHOOK_REQUEST_TIMEOUT=30s
+
+# Health Checks
+CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT=http://localhost:9000/health
+CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL=30s
+```
+
+This configuration:
+- Runs 4 concurrent receivers
+- Each receiver fetches 10 messages per poll
+- Each receiver has 10 workers (40 total concurrent webhook requests)
+- Processes up to 40 messages in parallel
+
+### Low Latency
+
+Optimized for processing messages as quickly as possible:
+
+```bash
+# SQS Configuration
+CARRIER_SQS_ENDPOINT=https://sqs.us-west-2.amazonaws.com
+CARRIER_SQS_QUEUE_NAME=low-latency-queue
+CARRIER_SQS_BATCH_SIZE=1
+CARRIER_SQS_RECEIVERS=1
+CARRIER_SQS_RECEIVER_WORKERS=1
+
+# Webhook Configuration
+CARRIER_WEBHOOK_ENDPOINT=http://localhost:9000/webhook
+CARRIER_WEBHOOK_REQUEST_TIMEOUT=10s
+
+# Health Checks
+CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT=http://localhost:9000/health
+CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL=10s
+```
+
+This configuration:
+- Processes messages one at a time
+- Minimizes overhead for low-volume queues
+- Reduces memory footprint
+
+### With Health Checks
+
+Ensures worker availability before processing:
+
+```bash
+# SQS Configuration
+CARRIER_SQS_ENDPOINT=https://sqs.us-west-2.amazonaws.com
+CARRIER_SQS_QUEUE_NAME=my-queue
+CARRIER_SQS_BATCH_SIZE=5
+
+# Webhook Configuration
+CARRIER_WEBHOOK_ENDPOINT=http://localhost:9000/webhook
+
+# Health Check Configuration
+CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT=http://localhost:9000/health
+CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL=30s
+CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT=5s
+CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT=3
+```
+
+## Environment Variable Source
+
+The configuration structure is defined in `main.go:23-40`:
+
+```go
+type Config struct {
+    EnableColorizedLogging       bool          `default:"false" split_words:"true"`
+    EnableStatLog                bool          `default:"false" split_words:"true"`
+    SQSBatchSize                 int           `envconfig:"SQS_BATCH_SIZE" default:"1"`
+    SQSEndpoint                  string        `envconfig:"SQS_ENDPOINT" required:"true"`
+    SQSQueueName                 string        `envconfig:"SQS_QUEUE_NAME" required:"true"`
+    SQSReceivers                 int           `envconfig:"SQS_RECEIVERS" default:"1"`
+    SQSReceiverWorkers           int           `envconfig:"SQS_RECEIVER_WORKERS" default:"1"`
+    StatLogTimer                 time.Duration `default:"120s" split_words:"true"`
+    WebhookEndpoint              string        `default:"http://localhost:9000" split_words:"true"`
+    WebhookTLSInsecureSkipVerify bool          `envconfig:"WEBHOOK_TLS_INSECURE_SKIP_VERIFY" default:"false"`
+    WebhookDefaultContentType    string        `default:"application/json" split_words:"true"`
+    WebhookRequestTimeout        time.Duration `default:"60s" split_words:"true"`
+    WebhookHealthCheckEndpoint   string        `split_words:"true"`
+    WebhookOfflineThresholdCount int           `default:"5" split_words:"true"`
+    WebhookHealthCheckInterval   time.Duration `default:"60s" split_words:"true"`
+    WebhookHealthCheckTimeout    time.Duration `default:"10s" split_words:"true"`
+}
+```
+
+## Quick Reference Table
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CARRIER_SQS_ENDPOINT` | Yes | - | SQS service endpoint URL |
+| `CARRIER_SQS_QUEUE_NAME` | Yes | - | Name of the SQS queue |
+| `CARRIER_SQS_BATCH_SIZE` | No | `1` | Messages per SQS poll (1-10) |
+| `CARRIER_SQS_RECEIVERS` | No | `1` | Concurrent SQS receivers |
+| `CARRIER_SQS_RECEIVER_WORKERS` | No | `1` | Workers per receiver |
+| `CARRIER_WEBHOOK_ENDPOINT` | No | `http://localhost:9000` | Webhook destination URL |
+| `CARRIER_WEBHOOK_REQUEST_TIMEOUT` | No | `60s` | Webhook request timeout |
+| `CARRIER_WEBHOOK_DEFAULT_CONTENT_TYPE` | No | `application/json` | Default Content-Type header |
+| `CARRIER_WEBHOOK_TLS_INSECURE_SKIP_VERIFY` | No | `false` | Skip TLS verification |
+| `CARRIER_WEBHOOK_HEALTH_CHECK_ENDPOINT` | No | - | Health check endpoint |
+| `CARRIER_WEBHOOK_HEALTH_CHECK_INTERVAL` | No | `60s` | Health check interval |
+| `CARRIER_WEBHOOK_HEALTH_CHECK_TIMEOUT` | No | `10s` | Health check timeout |
+| `CARRIER_WEBHOOK_OFFLINE_THRESHOLD_COUNT` | No | `5` | Failed checks before offline |
+| `CARRIER_ENABLE_COLORIZED_LOGGING` | No | `false` | Enable colored logs |
+| `CARRIER_ENABLE_STAT_LOG` | No | `false` | Enable statistics logging |
+| `CARRIER_STAT_LOG_TIMER` | No | `120s` | Statistics log interval |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Compose" icon="docker" href="/deployment/docker-compose">
+    Local deployment guide
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/deployment/kubernetes">
+    Production deployment guide
+  </Card>
+</CardGroup>
