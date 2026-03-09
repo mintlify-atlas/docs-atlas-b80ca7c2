@@ -1,0 +1,67 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Carrier",
+  "projectDescription": "A lightweight messaging adapter for webhooks designed as a sidecar container for the SQS event worker pattern.",
+  "theme": "aspen",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "introduction",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Deployment",
+        "pages": [
+          "deployment/docker-compose",
+          "deployment/kubernetes",
+          "deployment/configuration"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "architecture/overview",
+          "architecture/receivers",
+          "architecture/transmitters"
+        ]
+      },
+      {
+        "group": "Operations",
+        "pages": [
+          "operations/health-checks",
+          "operations/dynamic-visibility-timeouts",
+          "operations/monitoring"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/environment-variables",
+          "reference/http-headers"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Lightweight 8MB Docker image with <5MB RAM at idle",
+    "SQS to webhook message adapter",
+    "Health check monitoring for webhook endpoints",
+    "Dynamic visibility timeouts with exponential backoff",
+    "Kubernetes sidecar deployment pattern",
+    "Configurable batching and concurrency"
+  ],
+  "publicApiSurface": [
+    "SQS Receiver (receiver/sqs)",
+    "Webhook Transmitter (transmitter/webhook)",
+    "Health Checker (transmitter/webhook/HealthChecker)",
+    "Environment Variables (CARRIER_*)",
+    "HTTP Headers (X-Carrier-Receive-Count, X-Carrier-First-Receive-Time)",
+    "Message Attributes (Body.ContentType)"
+  ]
+}
